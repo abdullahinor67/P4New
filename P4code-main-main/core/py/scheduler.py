@@ -26,132 +26,157 @@ class Scheduler:
             print(f"Error loading files for {case}: {e}")
             return -1
 
-        # Prepare scheduling
         games = []
-        interval_tree_map = {}  # Separate interval trees for each field
+        field_interval_map = {}
+        team_interval_map = {}
 
-        # Determine scheduling logic based on case
-        # For cases 5-8, we attempt a more data-driven approach.
-        # We'll check if 'numberOfGames' column exists in league_df
+        # Initialize interval trees for all teams
+        all_teams = team_df["name"].unique()
+        for team in all_teams:
+            team_interval_map[team] = IntervalTree()
+
+        # For daily constraints in all cases:
+        team_daily_count = {}  # key: (team, season, week, day), value: count of games that day
+
         has_number_of_games = 'numberOfGames' in league_df.columns
 
-        # Schedule games for each league
         league_ids = team_df["leagueId"].unique()
         for league_id in league_ids:
             teams_in_league = team_df[team_df["leagueId"] == league_id]
             team_combinations = list(combinations(teams_in_league["name"], 2))
             league_name = league_df[league_df["leagueId"] == league_id]["leagueName"].iloc[0]
 
-            # Determine game_limit
+            # Determine game_limit based on the case
             if case == "case1":
-                # 8 Teams, 1 league, you previously set a fixed limit of 28 games
                 game_limit = 28
             elif case == "case2":
-                # Distribute 84 games across leagues
-                # If we have multiple leagues, this divides 84 by the number_of_leagues
                 game_limit = 84 // len(league_ids)
             elif case == "case3":
-                # 16 teams -> C(16,2)=120 unique combinations, you mentioned schedule all 120
                 game_limit = 120
             elif case == "case4":
-                # 24 teams -> C(24,2)=276 unique combinations, you used that exact number
-                game_limit = 276
+                game_limit = 168
             else:
-                # Cases 5-8: Try to use numberOfGames from the league.csv if available
+                # Cases 5–8 and generated
                 if has_number_of_games:
                     league_info = league_df[league_df["leagueId"] == league_id].iloc[0]
                     league_number_of_games = league_info.get("numberOfGames", None)
                     if pd.isna(league_number_of_games) or league_number_of_games <= 0:
-                        # If invalid, schedule all combinations
                         game_limit = len(team_combinations)
                     else:
-                        # Use min of provided numberOfGames and available matchups
                         game_limit = min(int(league_number_of_games), len(team_combinations))
                 else:
-                    # If no numberOfGames column is found, schedule all combinations
                     game_limit = len(team_combinations)
 
-            # Limit the team combinations
             team_combinations = team_combinations[:game_limit]
 
-            # Attempt to schedule each game pair
             for team1, team2 in team_combinations:
                 scheduled = Scheduler.schedule_team_pair(
-                    team1, team2, league_name, venue_df, interval_tree_map, games, case
+                    team1, team2, league_name, venue_df,
+                    field_interval_map, team_interval_map, team_daily_count, games, case
                 )
                 if not scheduled:
                     print(f"Could not schedule game between {team1} and {team2} for {league_name}")
 
-        # Save schedule to files
         Scheduler.save_schedule(games, output_schedule_csv, output_schedule_json)
         print(f"Schedule for {case} successfully saved to {output_schedule_csv} and {output_schedule_json}.")
         return 0
 
     @staticmethod
-    def schedule_team_pair(team1, team2, league_name, venue_df, interval_tree_map, games, case):
-        """
-        Schedule a pair of teams by iterating through weeks, days, and venues.
-        For case 3, we force only one field.
-        """
-        for _, venue_row in venue_df.iterrows():
-            fields_available = 1 if case == "case3" else int(venue_row["field"])
-            # Iterate weeks available for this venue
-            for week in range(venue_row["seasonStart"], venue_row["seasonEnd"] + 1):
-                # Iterate days of the week
-                for day in range(1, 8):
-                    scheduled = Scheduler.try_schedule_game(
-                        team1, team2, league_name, week, day, venue_row, interval_tree_map, case, fields_available
-                    )
-                    if scheduled:
-                        games.append(scheduled)
+    def schedule_team_pair(team1, team2, league_name, venue_df, field_interval_map, team_interval_map, team_daily_count, games, case):
+        for week in range(1, 53):
+            for day in range(1, 8):
+                for _, venue_row in venue_df.iterrows():
+                    if not Scheduler.is_within_season(week, venue_row):
+                        continue
+
+                    if Scheduler.try_schedule_game(team1, team2, league_name, week, day, venue_row,
+                                                   field_interval_map, team_interval_map, team_daily_count, case, games):
                         return True
         return False
 
     @staticmethod
-    def try_schedule_game(team1, team2, league_name, week, day, venue_row, interval_tree_map, case, fields_available):
-        """
-        Attempt to schedule a game at a specific venue on a given day and time.
-        Two fixed time slots: 9-11 AM and 2-4 PM
-        """
-        game_slots = [(9, 11), (14, 16)]
+    def is_within_season(week, venue_row):
+        return venue_row["seasonStart"] <= week <= venue_row["seasonEnd"]
 
-        for field_id in range(1, fields_available + 1):
-            if field_id not in interval_tree_map:
-                interval_tree_map[field_id] = IntervalTree()
+    @staticmethod
+    def try_schedule_game(team1, team2, league_name, week, day, venue_row,
+                          field_interval_map, team_interval_map, team_daily_count, case, games):
 
-            interval_tree = interval_tree_map[field_id]
+        fields_available = int(venue_row["field"]) if case != "case3" else 1
 
-            for start, end in game_slots:
-                interval = Interval(start=start, end=end, day=day, week=week)
-                # Check if no overlap
-                if not interval_tree.overlap(interval):
-                    interval_tree.insert(interval)
-                    return {
-                        "team1Name": team1,
-                        "team2Name": team2,
-                        "week": week,
-                        "day": day,
-                        "start": start,
-                        "end": end,
-                        "season": venue_row["seasonYear"],
-                        "league": league_name,
-                        "location": f"{venue_row['name']} Field #{field_id}",
-                    }
-        return None
+        venue_start = venue_row[f"d{day}Start"]
+        venue_end = venue_row[f"d{day}End"]
+
+        # Iterate over possible time slots
+        current_start = venue_start
+        while current_start + Scheduler.GAME_DURATION <= venue_end:
+            game_start = current_start
+            game_end = game_start + Scheduler.GAME_DURATION
+            interval = Interval(start=game_start, end=game_end, day=day, week=week)
+
+            # Check daily limit for both teams
+            season = venue_row["seasonYear"]
+            t1_key = (team1, season, week, day)
+            t2_key = (team2, season, week, day)
+            if team_daily_count.get(t1_key, 0) >= 1 or team_daily_count.get(t2_key, 0) >= 1:
+                # One of the teams already played this day
+                current_start += Scheduler.GAME_DURATION
+                continue
+
+            scheduled = False
+            for field_id in range(1, fields_available + 1):
+                if field_id not in field_interval_map:
+                    field_interval_map[field_id] = IntervalTree()
+
+                field_tree = field_interval_map[field_id]
+
+                # Check field overlap
+                if field_tree.overlap(interval):
+                    continue
+
+                # Check team overlap in time
+                if team_interval_map[team1].overlap(interval) or team_interval_map[team2].overlap(interval):
+                    continue
+
+                # If everything is clear, schedule the game
+                field_tree.insert(interval)
+                team_interval_map[team1].insert(interval)
+                team_interval_map[team2].insert(interval)
+
+                # Record daily play count for both teams
+                team_daily_count[t1_key] = team_daily_count.get(t1_key, 0) + 1
+                team_daily_count[t2_key] = team_daily_count.get(t2_key, 0) + 1
+
+                games.append({
+                    "team1Name": team1,
+                    "team2Name": team2,
+                    "week": week,
+                    "day": day,
+                    "start": game_start,
+                    "end": game_end,
+                    "season": venue_row["seasonYear"],
+                    "league": league_name,
+                    "location": f"{venue_row['name']} Field #{field_id}",
+                })
+                scheduled = True
+                break
+
+            if scheduled:
+                return True
+            current_start += Scheduler.GAME_DURATION
+        return False
 
     @staticmethod
     def save_schedule(games, csv_path, json_path):
-        """
-        Save the schedule to CSV and JSON files.
-        """
         if not games:
             print("No games were scheduled.")
-            # Create empty schedule files
             pd.DataFrame([]).to_csv(csv_path, index=False)
             pd.DataFrame([]).to_json(json_path, orient="records", indent=2)
             return
 
         schedule_df = pd.DataFrame(games)
+        # Sort by season, week, day, start
+        schedule_df = schedule_df.sort_values(by=["season", "week", "day", "start"])
         schedule_df.to_csv(csv_path, index=False)
         schedule_df.to_json(json_path, orient="records", indent=2)
 
