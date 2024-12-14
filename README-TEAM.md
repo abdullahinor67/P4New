@@ -92,4 +92,9 @@ data/<case>/
   - Re-running the test case.
 
 ---
+## Navigating the Server Interface
 
+- How to run the unit test cases
+  - First go to the correct directory by cding into P4code-main-main/core/test
+  - Then after that put the command "python3 test_scheduler.py"
+  - That should output the results
