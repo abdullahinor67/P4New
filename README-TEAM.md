@@ -93,6 +93,3 @@ data/<case>/
 
 ---
 
-## License
-
-[Specify license here, if applicable]
